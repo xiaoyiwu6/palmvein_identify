@@ -1,0 +1,10 @@
+debug/
+release/
+weights/
+gesture_roi/
+features/
+*.o
+*.pro*
+myfifo
+*.jpg
+UsbPalmCv
