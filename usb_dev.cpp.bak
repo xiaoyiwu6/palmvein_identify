@@ -1,0 +1,475 @@
+#include "usb_dev.h"
+
+using namespace std;
+using namespace cv;
+
+#define row 640
+#define col 480
+
+#define RX_BUF_SIZE	512
+
+#define EP_IN 0x81
+#define EP_OUT 0x01
+
+libusb_context *ctx = NULL;
+struct libusb_device_handle *dev_handle = NULL;
+static int kernelDriverDetached = 0;
+
+typedef enum {
+    PIXFORMAT_RGB565,    // 2BPP/RGB565
+    PIXFORMAT_YUV422,    // 2BPP/YUV422
+    PIXFORMAT_GRAYSCALE, // 1BPP/GRAYSCALE
+    PIXFORMAT_JPEG,      // JPEG/COMPRESSED
+    PIXFORMAT_RGB888,    // 3BPP/RGB888
+    PIXFORMAT_RAW,       // RAW
+    PIXFORMAT_RGB444,    // 3BP2P/RGB444
+    PIXFORMAT_RGB555,    // 3BP2P/RGB555
+} pixformat_t;
+
+static bool LightAutoAdj = false;
+static uint16_t Light850_Value = 6;
+static uint16_t Light940_Value = 0;
+static int16_t expValue = 0;
+static int8_t contrastLevel = 0;
+
+
+//
+//  usb_dev_init.
+//
+bool usb_dev_init(void)
+{
+    if( libusb_init( &ctx ) == 0 )
+    {
+		libusb_set_debug(ctx, 3);
+		return true;
+    }
+
+    return false;
+}
+
+//
+//  usb_dev_exit.
+//
+void usb_dev_exit(void)
+{
+    libusb_exit(ctx);
+}
+
+//
+//  usb_dev_open.
+//
+bool usb_dev_open( uint16_t vendor_id, uint16_t product_id )
+{
+    if( dev_handle )
+    {
+		libusb_release_interface( dev_handle, 0 );
+	
+		if( kernelDriverDetached )
+		{
+			libusb_attach_kernel_driver( dev_handle, 0 );
+			kernelDriverDetached = 0;
+		}
+
+		libusb_close( dev_handle );
+
+		dev_handle = NULL;
+    }
+    dev_handle = libusb_open_device_with_vid_pid( ctx, vendor_id, product_id);
+
+	libusb_set_configuration(dev_handle, 1);
+
+    if( libusb_kernel_driver_active( dev_handle, 0 ) == 1 )
+    {
+      	if( libusb_detach_kernel_driver( dev_handle, 0 ) == 0 )
+		{
+	    	kernelDriverDetached = 1;
+		}
+        else
+        {
+	    	return false;
+        }
+    }
+    
+    if( libusb_claim_interface( dev_handle, 0 ) == 0 )
+    {
+		return true;
+    }
+
+    return false;
+}
+//
+//  usb_dev_close.
+//
+void usb_dev_close(void)
+{
+    libusb_release_interface( dev_handle, 0 );
+    libusb_close( dev_handle );
+}
+//
+//  usb_dev_isopen.
+//
+bool usb_dev_isopen( void )
+{
+	if( dev_handle != NULL )
+	{
+		return true;
+	}
+
+	return false;
+}
+//
+//  callbackSend.
+//
+void callbackSend(struct libusb_transfer *transfer)
+{
+	if (transfer->status != LIBUSB_TRANSFER_COMPLETED)
+	{
+		libusb_submit_transfer( transfer );
+	}
+
+	libusb_free_transfer( transfer );
+}
+//
+//  usb_dev_write_async.
+//
+bool usb_dev_write_async( uint8_t *Datas, uint16_t DataLen, int timeout )
+{
+	int ret;
+
+	if( dev_handle == NULL )
+	{
+		return false;
+	}
+
+	struct libusb_transfer *transfer = libusb_alloc_transfer(0);
+
+	libusb_fill_bulk_transfer( transfer, dev_handle, EP_OUT, Datas, DataLen,                      		&callbackSend,0,timeout);
+
+	ret = libusb_submit_transfer( transfer );
+
+	if( ret < 0 )
+	{
+		libusb_free_transfer( transfer );
+
+		return false;
+	}
+
+	return true;
+}
+//
+//  usb_dev_write_sync.
+//
+bool usb_dev_write_sync( uint8_t *Datas, uint16_t DataLen, int timeout )
+{
+	int ret;
+	int actual_len;
+
+	if( dev_handle == NULL )
+	{
+		return false;
+	}
+
+	ret = libusb_bulk_transfer( dev_handle, EP_OUT, Datas, DataLen, &actual_len, timeout);
+	
+	if( ret == 0 )
+	{
+		return true;
+	}
+
+	printf("usb_dev_write_sync error,%d\n", ret);
+
+	return false;
+}
+//
+//  usb_dev_read_sync.
+//
+int usb_dev_read_sync( uint8_t *Buf, uint16_t bufsz, int timeout )
+{
+	int ret;
+	int actual_len = 0;
+
+	if( dev_handle == NULL )
+	{
+		return 0;
+	}
+
+	ret = libusb_bulk_transfer( dev_handle, EP_IN, Buf, bufsz, &actual_len, timeout);
+
+   	if( ret == 0 )
+	{
+		return actual_len;	
+	}
+	
+	printf("usb_dev_read_sync error,%d\n", ret);
+
+	return 0;
+}
+
+
+
+//
+//	ImageShow().
+//
+Mat ImageShow(uint8_t *Datas)
+{
+    uint16_t width = (Datas[0] << 8) | Datas[1];
+    uint16_t height = (Datas[2] << 8) | Datas[3];
+    uint8_t format = Datas[4];
+
+    uint8_t *SrcPtr = &Datas[5];
+
+    Mat imageGray;
+
+    Mat image;
+
+    if( format == PIXFORMAT_GRAYSCALE )
+    {
+        image = Mat( height, width, CV_8UC1, SrcPtr );
+
+        imageGray = image;
+    }
+    else if( format == PIXFORMAT_YUV422 )
+    {
+        Mat imageSrc = Mat( height, width, CV_8UC2, SrcPtr );
+
+        image = Mat( height, width, CV_8UC3 );
+
+        cvtColor( imageSrc,image, 115 );
+
+        cvtColor( image,imageGray, 7 );
+    }
+
+
+    Mat imageRotate = Mat::zeros(imageGray.size(), imageGray.type());
+
+    transpose(imageGray, imageRotate);
+    flip(imageRotate, imageRotate, -1);
+    //Todo : wirite to fifo
+
+    //Todo: gesture_detect 
+
+    //Mat imageShow;
+
+    //imageShow = imageRotate;
+
+    //resizeWindow("showNamed", imageShow.cols, imageShow.rows );
+
+
+    //imshow("showNamed", imageShow );
+    /*user programer*/
+
+}
+
+
+//
+//	GetImageThread
+//
+void* GetImageThread(void *argv)
+{
+    int num = *(int*)argv;
+    uint8_t DataBuf[1024*1024];
+    uint8_t CapCnt = 0;
+    uint32_t RecvCnt = 0;
+    uint32_t PacketLen = 0;
+    uint8_t HeadFlag = 0;
+
+    uint8_t TxBuff[64];
+    uint8_t RxBuff[RX_BUF_SIZE];
+
+    /*int fd = open("./myfifo", O_WRONLY);
+    if(fd < 0)
+    {
+        printf("open errer");
+        return;
+    }*/
+
+    int count = 0;
+    while( usb_dev_isopen() && count<num )
+    {
+        if( (HeadFlag == 0) && (RecvCnt == 0 ) )
+        {
+            if (LightAutoAdj == true)
+            {
+                if (CapCnt == 3)
+                {
+                    Light850_Value = 0;
+                    Light940_Value = 6;
+                }
+                else if (CapCnt == 6)
+                {
+                    Light850_Value = 4;
+                    Light940_Value = 4;
+                }
+                else if (CapCnt >= 9)
+                {
+                    CapCnt = 0;
+
+                    Light850_Value = 6;
+                    Light940_Value = 0;
+                }
+
+            }
+
+            TxBuff[0] = 0xAA;
+            TxBuff[1] = 0x05;
+            TxBuff[2] = Light850_Value;				//LightValue1.
+            TxBuff[3] = Light940_Value;				//LightValue2.
+            TxBuff[4] = (expValue >> 8) & 0xFF;						//Exposure time added value.
+            TxBuff[5] = expValue & 0xFF;
+            TxBuff[6] = contrastLevel;
+            TxBuff[7] = 0x55;
+
+            if( usb_dev_write_sync( (uint8_t *)TxBuff,8, 1000 ) == false )
+            {
+                break;
+            }
+
+            printf("usb_dev_write_sync\n");
+        }
+
+        int ret = usb_dev_read_sync( RxBuff, RX_BUF_SIZE, 5000 );
+
+        if( ( ret < 0 ) )
+        {
+            printf("usb_dev_read_sync fail,%d\n", ret);
+            break;
+        }
+
+        memcpy( &DataBuf[RecvCnt], RxBuff, ret );
+
+        RecvCnt += ret;
+        printf("%d %d\n", RecvCnt, PacketLen);
+        if( HeadFlag != 0 )
+        {
+            printf("HeadFlag!=0\n");
+            if( RecvCnt >= PacketLen )
+            {
+                if( DataBuf[PacketLen - 1] == 0xAA )
+                {
+                    uint8_t *Datas = (uint8_t *)malloc( PacketLen - 7 );
+                    if( Datas != NULL )
+                    {
+                        printf("get Datas\n");
+                        memcpy(Datas, &DataBuf[6], PacketLen - 7 );
+
+                        ImageShow(Datas);
+			count++;
+                        //waitKey(30);
+                        //Mat image;
+                        //image = ImageShow(Datas);
+                        //free(Datas);
+
+                        /*uint8_t tempBuf[row*col + 5];
+                        memcpy(tempBuf, Datas, row*col+5);
+                        free(Datas);
+                        write(fd, tempBuf, sizeof(tempBuf));
+                        usleep(3000);*/
+
+                    }
+                    else printf("datas==null\n");
+                }
+                else
+                {
+                    printf("Packet error\n");
+                }
+
+                HeadFlag = 0;
+                RecvCnt = 0;
+            }
+            printf("RecvCnt < PacketLen\n");
+        }
+        else if( RecvCnt >= 6 )
+        {
+            printf("RecvCnt >= 6\n");
+            for( uint32_t i = 0; i < RecvCnt; i ++ )
+            {
+                if( DataBuf[i] == 0xA5 )
+                {
+                    if( DataBuf[i + 1] == 0x5A )
+                    {
+                        PacketLen = (DataBuf[i + 2] << 24) | (DataBuf[i + 3] << 16) | (DataBuf[i + 4] << 8) | DataBuf[i + 5];
+                        PacketLen += 3;
+
+                        if( PacketLen < 1024*1024 )
+                        {
+                            memcpy( DataBuf, &DataBuf[i], RecvCnt - i );
+                            RecvCnt = RecvCnt - i;
+
+                            HeadFlag = 1;
+                        }
+                    }
+                }
+            }
+        }
+        else if( RecvCnt >= 1024*1024 )
+        {
+            RecvCnt = 0;
+            printf("RecvCnt Overlength\n");
+        }
+
+    }
+    usb_dev_close();
+    usb_dev_exit();
+}
+
+void camera_thread(int num) {
+    if( usb_dev_init() == false )
+    {
+        printf("usb_dev_init fail!\n");
+        return;
+    }
+
+    printf("usb_dev_init ok\n");
+    if( usb_dev_open( 0x303A, 0x3002 ) == false )
+    {
+        printf("usb_dev_open fail!\n");
+        return;
+    }
+    printf("usb_dev_open ok\n");
+    int count = 0;
+    while(count < num) {
+        uint8_t *data = GetImageThread();
+        if(data) {
+            cv::Mat image;
+            image = ImageShow(data);
+            //if(palmprint_detect_roi(rexnet, image, "../gesture_roi", 15000)) {
+            //    count++;
+            //}
+            count++;
+            cv::imshow("image", image);
+            cv::waitKey(10);
+
+            cv::imwrite("../gesture_dect/" + to_string(count) + ".jpg", image);
+        }
+    }
+    /*int fd = mkfifo("./myfifo", O_NONBLOCK);
+    if(fd < 0)
+    {
+        printf("open errer");
+        return;
+    }
+
+    GetImageThread();
+    fd = open("./myfifo", O_WRONLY);
+    int length = 307205;
+    uint8_t *Datas = (uint8_t *)malloc( length );
+    memcpy(Datas, 0, length);
+    while(count < num) {
+        read(fd, Datas, length);
+        if(sizeof(Datas) == length) {
+            Mat image;
+            image = ImageShow(Datas);
+            //if(palmprint_detect_roi(rexnet, image, "../gesture_roi", 15000)) {
+            //    count++;
+            //}
+            count++;
+            cv::imshow("image", image);
+            cv::waitKey(10);
+
+            cv::imwrite("../gesture_dect/" + to_string(count) + ".jpg", image);
+        }
+    }*/
+    usb_dev_close();
+    usb_dev_exit();
+    cv::destroyAllWindows();
+}
